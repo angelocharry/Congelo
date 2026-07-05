@@ -73,6 +73,7 @@
   .pill b{font-weight:800;}
   .pill.warn{background:var(--soon-bg);border-color:#efd9a6;color:#7a5410;}
   .pill.bad{background:var(--expired-bg);border-color:#f2bcbc;color:#8f2020;}
+  .pill.ok{background:var(--fresh-bg);border-color:#bfe6cd;color:#166534;}
 
   /* ---------- Alert banner ---------- */
   .banner{
@@ -312,6 +313,27 @@
 <div class="toast" id="toast"><span id="toast-msg"></span></div>
 
 <script>
+/* ================================================================
+   CONFIGURATION FIREBASE  —  À REMPLIR (voir la notice fournie)
+   Colle ici la config de TON projet Firebase.
+   (Console Firebase → ⚙ Paramètres du projet → « Vos applications » → Config)
+   Tant que ce n'est pas rempli, l'appli tourne en local (sans synchro).
+   ================================================================ */
+window.FIREBASE_CONFIG = {
+  apiKey: "AIzaSyCCSWGt6iXoIJ0QDysFoGzxUme2hL6w_eE",
+  authDomain: "congelo-famille.firebaseapp.com",
+  projectId: "congelo-famille",
+  storageBucket: "congelo-famille.firebasestorage.app",
+  messagingSenderId: "1082206331372",
+  appId: "1:1082206331372:web:9827506b2782bd4d39e0c9"
+};
+
+/* Facultatif : code partagé par défaut sur tous les appareils.
+   Laisse "" pour que chaque appareil demande le code une fois (plus privé). */
+window.DEFAULT_HOUSEHOLD_ID = "";
+</script>
+
+<script>
 "use strict";
 
 /* ============================================================
@@ -396,6 +418,8 @@ const FREEZERS = {
 const KEY = "congelateur_v1";
 const KEY_CATS = "congelateur_cats_v1";
 const KEY_PRODUCTS = "congelateur_prods_v1";
+const KEY_REV = "congelateur_rev_v1";
+const KEY_CODE = "congelateur_code_v1";
 const LS_OK = (function(){
   try{ localStorage.setItem("__t","1"); localStorage.removeItem("__t"); return true; }
   catch(e){ return false; }
@@ -404,17 +428,20 @@ const mem = {};
 function store(k,v){ if(LS_OK){ try{ localStorage.setItem(k,v); return; }catch(e){} } mem[k]=v; }
 function read(k){ if(LS_OK){ try{ const r=localStorage.getItem(k); if(r!==null) return r; }catch(e){} } return mem[k]??null; }
 
+/* Code famille (partagé entre appareils), lu par le script Firebase en bas du fichier */
+window.HOUSEHOLD_ID = (read(KEY_CODE) || window.DEFAULT_HOUSEHOLD_ID || "").trim();
+
 /* Base alimentaire MODIFIABLE : repart des valeurs par défaut au 1er lancement */
 function loadCats(){
   try{ const r=read(KEY_CATS); if(r){ const o=JSON.parse(r); if(o && typeof o==="object" && Object.keys(o).length) return o; } }catch(e){}
   return JSON.parse(JSON.stringify(DEFAULT_CATEGORIES));
 }
-function saveCats(){ store(KEY_CATS, JSON.stringify(CATEGORIES)); }
+function saveCats(){ store(KEY_CATS, JSON.stringify(CATEGORIES)); touch(); }
 function loadProducts(){
   try{ const r=read(KEY_PRODUCTS); if(r){ const a=JSON.parse(r); if(Array.isArray(a)) return a; } }catch(e){}
   return DEFAULT_PRODUCTS.map(p=>p.slice());
 }
-function saveProducts(){ store(KEY_PRODUCTS, JSON.stringify(PRODUCTS)); }
+function saveProducts(){ store(KEY_PRODUCTS, JSON.stringify(PRODUCTS)); touch(); }
 
 let CATEGORIES = loadCats();
 let PRODUCTS = loadProducts();
@@ -429,7 +456,51 @@ function migrateItem(it){
 function loadItems(){
   try{ const r=read(KEY); const a = r ? JSON.parse(r) : []; return Array.isArray(a) ? a.map(migrateItem) : []; }catch(e){ return []; }
 }
-function saveItems(){ store(KEY, JSON.stringify(state.items)); }
+function saveItems(){ store(KEY, JSON.stringify(state.items)); touch(); }
+
+/* ---------- Synchro cloud (le script Firebase est en bas du fichier) ---------- */
+let localRev = Number(read(KEY_REV)) || 0;
+let cloudStatus = "local";
+let cloudTimer = null;
+
+function touch(){ localRev = Date.now(); store(KEY_REV, String(localRev)); scheduleCloudPush(); }
+function scheduleCloudPush(){
+  if(!window.__cloudSave) return;
+  clearTimeout(cloudTimer);
+  cloudTimer = setTimeout(()=>{
+    try{ window.__cloudSave({items:state.items, categories:CATEGORIES, products:PRODUCTS, updatedAt:localRev, appVersion:3}); }catch(e){}
+  }, 400);
+}
+window.__cloudSetStatus = function(s){
+  cloudStatus = s;
+  if(document.getElementById("summary")) renderSummary();
+  if(state.view==="backup") renderBackup();
+};
+window.__cloudPushInitial = function(){
+  if(!window.__cloudSave) return;
+  if(!localRev){ localRev = Date.now(); store(KEY_REV, String(localRev)); }
+  window.__cloudSave({items:state.items, categories:CATEGORIES, products:PRODUCTS, updatedAt:localRev, appVersion:3});
+};
+window.__cloudRemote = function(data){
+  if(!data || typeof data!=="object") return;
+  const rev = Number(data.updatedAt)||0;
+  if(rev < localRev){ scheduleCloudPush(); return; }   // le cloud est en retard : on renvoie notre version
+  if(rev === localRev){ return; }                       // écho de notre propre écriture
+  if(Array.isArray(data.items)) state.items = data.items.map(migrateItem);
+  if(data.categories && typeof data.categories==="object" && Object.keys(data.categories).length){
+    CATEGORIES = data.categories;
+    if(!CATEGORIES.autre) CATEGORIES.autre = {label:"Autre", months:6, icon:"📦"};
+  }
+  if(Array.isArray(data.products)) PRODUCTS = data.products;
+  localRev = rev;
+  store(KEY, JSON.stringify(state.items));
+  store(KEY_CATS, JSON.stringify(CATEGORIES));
+  store(KEY_PRODUCTS, JSON.stringify(PRODUCTS));
+  store(KEY_REV, String(localRev));
+  const busy = (state.view==="add") || (state.view==="manage" && (state.pEdit!==null || state.cEdit!==null));
+  if(busy){ if(document.getElementById("summary")) renderSummary(); }
+  else { render(); }
+};
 
 /* ============================================================
    ÉTAT + OUTILS DATES
@@ -515,7 +586,17 @@ function renderSummary(){
   let h = `<span class="pill">🗂️ <b>${n}</b> produit${n>1?"s":""}</span>`;
   if(warn) h += `<span class="pill warn">🕒 <b>${warn}</b> à consommer</span>`;
   if(exp)  h += `<span class="pill bad">⛔ <b>${exp}</b> périmé${exp>1?"s":""}</span>`;
+  h += syncPill();
   document.getElementById("summary").innerHTML = h;
+}
+function syncPill(){
+  switch(cloudStatus){
+    case "online":     return `<span class="pill ok">☁️ Synchronisé</span>`;
+    case "offline":    return `<span class="pill warn">☁️ Hors ligne</span>`;
+    case "connecting": return `<span class="pill">☁️ Connexion…</span>`;
+    case "needcode":   return `<span class="pill warn">☁️ À connecter</span>`;
+    default:           return `<span class="pill">💾 Cet appareil</span>`;
+  }
 }
 
 /* ---------- Vue LISTE ---------- */
@@ -853,24 +934,69 @@ function renderDrawers(){
 }
 
 /* ---------- Vue SAUVEGARDE ---------- */
+function hasFirebase(){ const c=window.FIREBASE_CONFIG; return !!(c && c.apiKey && String(c.apiKey).indexOf("COLLE")!==0 && c.projectId); }
+function currentCode(){ return (read(KEY_CODE) || window.DEFAULT_HOUSEHOLD_ID || "").trim(); }
+function connectCode(){
+  let v=(document.getElementById("codeinput").value||"").trim().toLowerCase().replace(/[^a-z0-9\-_]/g,"");
+  if(v.length<4){ toast("Choisis un code d'au moins 4 caractères 🙂"); return; }
+  store(KEY_CODE, v);
+  toast("Connexion en cours…");
+  setTimeout(()=>location.reload(), 350);
+}
+function disconnectCloud(){
+  if(!confirm("Déconnecter cet appareil de la synchro ? Les produits restent enregistrés sur l'appareil.")) return;
+  store(KEY_CODE, "");
+  if(LS_OK){ try{ localStorage.removeItem(KEY_CODE); }catch(e){} }
+  setTimeout(()=>location.reload(), 200);
+}
+
 function renderBackup(){
   const n=state.items.length;
   const byCat={};
   state.items.forEach(i=>{ byCat[i.cat]=(byCat[i.cat]||0)+1; });
   const stats = Object.entries(byCat).sort((a,b)=>b[1]-a[1]).map(([k,v])=>{
     const c=CATEGORIES[k]||CATEGORIES.autre;
-    return `<div class="stat"><span>${c.icon} ${c.label}</span><b>${v}</b></div>`;
+    return `<div class="stat"><span>${c.icon} ${esc(c.label)}</span><b>${v}</b></div>`;
   }).join("") || `<div class="stat"><span>Rien pour l'instant</span><b>0</b></div>`;
 
-  viewEl.innerHTML = `
+  // --- Bloc synchronisation ---
+  const code=currentCode();
+  let sync="";
+  if(!hasFirebase()){
+    sync = `<div class="info">
+      <h2>☁️ Synchronisation</h2>
+      <p>La synchro automatique n'est pas encore activée dans ce fichier. Une fois Firebase renseigné (voir la notice fournie), ce panneau permettra de connecter l'appareil. En attendant, tu peux synchroniser à la main avec l'export / import ci-dessous.</p>
+    </div>`;
+  } else if(!code){
+    sync = `<div class="info">
+      <h2>☁️ Connecter cet appareil</h2>
+      <p>Entre un <b>code famille</b> : invente-le une fois, puis mets exactement le même sur le téléphone et sur l'ordinateur. Les modifications se synchronisent alors toutes seules.</p>
+      <div class="field"><label>Code famille</label>
+        <input id="codeinput" type="text" placeholder="ex. congelo-martin-7429" autocomplete="off"></div>
+      <button class="btn primary" style="width:100%" onclick="connectCode()">☁️ Connecter</button>
+      <p style="font-size:12.5px;color:var(--muted);margin-top:12px">Astuce : choisis un code un peu unique (avec des chiffres) — c'est lui qui protège l'accès à ta liste.</p>
+    </div>`;
+  } else {
+    const line = cloudStatus==="online"
+        ? `<span style="color:var(--fresh);font-weight:800">● En ligne — tout est synchronisé</span>`
+      : cloudStatus==="offline"
+        ? `<span style="color:var(--soon);font-weight:800">● Hors ligne — mise à jour au retour du réseau</span>`
+        : `<span style="color:var(--muted);font-weight:800">● Connexion…</span>`;
+    sync = `<div class="info">
+      <h2>☁️ Synchronisation active</h2>
+      <p style="margin-bottom:12px">${line}</p>
+      <div class="stat"><span>Code famille</span><b>${esc(code)}</b></div>
+      <p style="font-size:13px;color:var(--muted);margin:12px 0 14px">Tous les appareils qui utilisent ce même code partagent automatiquement la liste.</p>
+      <button class="btn ghost" style="width:100%" onclick="disconnectCloud()">Déconnecter / changer de code</button>
+    </div>`;
+  }
+
+  viewEl.innerHTML = sync + `
   <div class="info">
-    <h2>Sauvegarde & synchro</h2>
-    <p>Tes produits sont enregistrés automatiquement sur cet appareil. Pour retrouver la même liste sur le téléphone <b>et</b> l'ordinateur, sers-toi de l'export / import via un dossier partagé (Drive, iCloud, Dropbox…).</p>
-    <div class="step"><span class="num">1</span><span>Sur l'appareil à jour : appuie sur <b>Exporter</b> (produits + tes catégories et aliments personnalisés). Un fichier se télécharge.</span></div>
-    <div class="step"><span class="num">2</span><span>Dépose ce fichier dans ton dossier Drive partagé.</span></div>
-    <div class="step"><span class="num">3</span><span>Sur l'autre appareil : ouvre cette page, appuie sur <b>Importer</b> et choisis le fichier.</span></div>
+    <h2>💾 Sauvegarde manuelle</h2>
+    <p>Pour garder une copie de secours, ou transférer vers un appareil sans synchro. Le fichier contient tout : produits, catégories et aliments.</p>
     <div class="actions">
-      <button class="btn primary" onclick="exportData()">⬇️ Exporter mes produits</button>
+      <button class="btn primary" onclick="exportData()">⬇️ Exporter dans un fichier</button>
       <button class="btn ghost" onclick="document.getElementById('importfile').click()">⬆️ Importer un fichier</button>
       <input id="importfile" type="file" accept=".json,application/json" class="hidden" onchange="importData(this.files[0])">
     </div>
@@ -889,7 +1015,7 @@ function renderBackup(){
   </div>
 
   <p style="text-align:center;color:var(--muted);font-size:12px;margin:18px 0 4px">
-    Fonctionne sans internet. Durées de conservation indicatives.
+    Synchro temps réel via Firebase (niveau gratuit). Durées de conservation indicatives.
   </p>`;
 }
 
@@ -1182,6 +1308,50 @@ document.getElementById("nav").addEventListener("click", e=>{
 });
 
 render();
+</script>
+
+<!-- ================================================================
+     SYNCHRONISATION FIREBASE (temps réel). Ne rien modifier ici.
+     Se connecte seulement si la config Firebase + un code sont présents.
+     ================================================================ -->
+<script type="module">
+  const cfg = window.FIREBASE_CONFIG;
+  const HID = window.HOUSEHOLD_ID;
+  const hasCfg = !!(cfg && cfg.apiKey && cfg.apiKey.indexOf("COLLE")!==0 && cfg.projectId);
+  const set = (s)=> window.__cloudSetStatus && window.__cloudSetStatus(s);
+
+  if(!hasCfg){ set("local"); }
+  else if(!HID){ set("needcode"); }
+  else {
+    set("connecting");
+    try{
+      const V="12.15.0", B="https://www.gstatic.com/firebasejs/"+V+"/";
+      const [{ initializeApp }, { getAuth, signInAnonymously, onAuthStateChanged }, { getFirestore, doc, onSnapshot, setDoc }] =
+        await Promise.all([
+          import(B+"firebase-app.js"),
+          import(B+"firebase-auth.js"),
+          import(B+"firebase-firestore.js"),
+        ]);
+      const app  = initializeApp(cfg);
+      const auth = getAuth(app);
+      const db   = getFirestore(app);
+      const ref  = doc(db, "menages", HID);
+
+      window.__cloudSave = (data)=>{ setDoc(ref, data).catch(e=>console.warn("cloud save:", e.message)); };
+
+      onAuthStateChanged(auth, (user)=>{
+        if(!user){ signInAnonymously(auth).catch(e=>{ console.warn("auth:", e.message); set("offline"); }); return; }
+        onSnapshot(ref, { includeMetadataChanges:true },
+          (snap)=>{
+            set(snap.metadata.fromCache ? "offline" : "online");
+            if(snap.exists()){ window.__cloudRemote && window.__cloudRemote(snap.data()); }
+            else if(!snap.metadata.fromCache){ window.__cloudPushInitial && window.__cloudPushInitial(); }
+          },
+          (err)=>{ console.warn("cloud snapshot:", err.message); set("offline"); }
+        );
+      });
+    }catch(e){ console.warn("Firebase init:", e.message); set("offline"); }
+  }
 </script>
 </body>
 </html>
