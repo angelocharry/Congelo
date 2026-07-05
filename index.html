@@ -327,7 +327,6 @@ window.FIREBASE_CONFIG = {
   messagingSenderId: "1082206331372",
   appId: "1:1082206331372:web:9827506b2782bd4d39e0c9"
 };
-
 /* Facultatif : code partagé par défaut sur tous les appareils.
    Laisse "" pour que chaque appareil demande le code une fois (plus privé). */
 window.DEFAULT_HOUSEHOLD_ID = "";
@@ -464,34 +463,44 @@ let cloudStatus = "local";
 let cloudTimer = null;
 
 function touch(){ localRev = Date.now(); store(KEY_REV, String(localRev)); scheduleCloudPush(); }
+/* Document cloud = 1 seule chaîne JSON -> évite les limites de types Firestore
+   (notamment l'interdiction des tableaux imbriqués comme la liste PRODUCTS). */
+function cloudDoc(){
+  return {
+    payload: JSON.stringify({ items:state.items, categories:CATEGORIES, products:PRODUCTS }),
+    updatedAt: localRev,
+    appVersion: 3
+  };
+}
 function scheduleCloudPush(){
   if(!window.__cloudSave) return;
   clearTimeout(cloudTimer);
-  cloudTimer = setTimeout(()=>{
-    try{ window.__cloudSave({items:state.items, categories:CATEGORIES, products:PRODUCTS, updatedAt:localRev, appVersion:3}); }catch(e){}
-  }, 400);
+  cloudTimer = setTimeout(()=>{ try{ window.__cloudSave(cloudDoc()); }catch(e){} }, 400);
 }
 window.__cloudSetStatus = function(s){
   cloudStatus = s;
   if(document.getElementById("summary")) renderSummary();
   if(state.view==="backup") renderBackup();
 };
+window.__cloudNotify = function(msg){ toast(msg); };
 window.__cloudPushInitial = function(){
   if(!window.__cloudSave) return;
   if(!localRev){ localRev = Date.now(); store(KEY_REV, String(localRev)); }
-  window.__cloudSave({items:state.items, categories:CATEGORIES, products:PRODUCTS, updatedAt:localRev, appVersion:3});
+  window.__cloudSave(cloudDoc());
 };
 window.__cloudRemote = function(data){
   if(!data || typeof data!=="object") return;
   const rev = Number(data.updatedAt)||0;
   if(rev < localRev){ scheduleCloudPush(); return; }   // le cloud est en retard : on renvoie notre version
   if(rev === localRev){ return; }                       // écho de notre propre écriture
-  if(Array.isArray(data.items)) state.items = data.items.map(migrateItem);
-  if(data.categories && typeof data.categories==="object" && Object.keys(data.categories).length){
-    CATEGORIES = data.categories;
+  let payload = null;
+  try{ payload = data.payload ? JSON.parse(data.payload) : data; }catch(e){ return; }
+  if(Array.isArray(payload.items)) state.items = payload.items.map(migrateItem);
+  if(payload.categories && typeof payload.categories==="object" && Object.keys(payload.categories).length){
+    CATEGORIES = payload.categories;
     if(!CATEGORIES.autre) CATEGORIES.autre = {label:"Autre", months:6, icon:"📦"};
   }
-  if(Array.isArray(data.products)) PRODUCTS = data.products;
+  if(Array.isArray(payload.products)) PRODUCTS = payload.products;
   localRev = rev;
   store(KEY, JSON.stringify(state.items));
   store(KEY_CATS, JSON.stringify(CATEGORIES));
@@ -1337,7 +1346,13 @@ render();
       const db   = getFirestore(app);
       const ref  = doc(db, "menages", HID);
 
-      window.__cloudSave = (data)=>{ setDoc(ref, data).catch(e=>console.warn("cloud save:", e.message)); };
+      let warnedWrite = false;
+      window.__cloudSave = (data)=>{
+        setDoc(ref, data).catch(e=>{
+          console.warn("cloud save:", e.message);
+          if(!warnedWrite){ warnedWrite = true; window.__cloudNotify && window.__cloudNotify("Erreur d'enregistrement cloud : " + e.message); }
+        });
+      };
 
       onAuthStateChanged(auth, (user)=>{
         if(!user){ signInAnonymously(auth).catch(e=>{ console.warn("auth:", e.message); set("offline"); }); return; }
